@@ -1,5 +1,5 @@
 ---
-- name: Configure EC2 instance and deploy FastAPI application
+- name: Deploy FastAPI application
   hosts: all
   become: true
   gather_facts: true
@@ -7,54 +7,62 @@
   vars:
     app_dir: /opt/app
     venv_dir: /opt/app/.venv
+    service_name: app
     app_user: ec2-user
-    gunicorn_workers: 4
+    gunicorn_bin: /opt/app/.venv/bin/gunicorn
     app_port: 8000
 
   tasks:
-    #  System packages 
 
-    - name: Update system packages (Amazon Linux 2023)
+    # -------------------------------------------------------------------------
+    # System packages
+    # -------------------------------------------------------------------------
+    - name: Update dnf cache
       dnf:
-        name: "*"
-        state: latest
-        update_only: true
-      when: ansible_facts['os_family'] == 'RedHat'
+        update_cache: true
+      when: ansible_pkg_mgr == "dnf"
 
-    - name: Install required system packages (Amazon Linux 2023)
+    - name: Install system packages (Amazon Linux 2023 / dnf)
       dnf:
         name:
           - python3.11
           - python3.11-pip
           - python3.11-devel
           - nginx
-          - gcc
           - git
-          - rsync
+          - gcc
+          - make
         state: present
-      when: ansible_facts['os_family'] == 'RedHat'
+      when: ansible_pkg_mgr == "dnf"
 
-    - name: Update system packages (Ubuntu)
-      apt:
-        update_cache: true
-        upgrade: safe
-      when: ansible_facts['os_family'] == 'Debian'
-
-    - name: Install required system packages (Ubuntu)
+    - name: Install system packages (Ubuntu / apt)
       apt:
         name:
           - python3.11
           - python3.11-venv
           - python3.11-dev
           - nginx
-          - gcc
           - git
-          - rsync
+          - gcc
+          - make
         state: present
-      when: ansible_facts['os_family'] == 'Debian'
+        update_cache: true
+      when: ansible_pkg_mgr == "apt"
 
-    #  Application directory 
+    # -------------------------------------------------------------------------
+    # Create venv explicitly (needed on distros where python3.11 ships without
+    # ensurepip / venv built in)
+    # -------------------------------------------------------------------------
+    - name: Install python3.11-pip via get-pip on Amazon Linux if needed
+      shell: |
+        python3.11 -m ensurepip --upgrade || true
+        python3.11 -m pip install --upgrade pip virtualenv || true
+      args:
+        executable: /bin/bash
 
+    # -------------------------------------------------------------------------
+    # Application directory
+    # -------------------------------------------------------------------------
     - name: Create application directory
       file:
         path: "{{ app_dir }}"
@@ -63,19 +71,28 @@
         group: "{{ app_user }}"
         mode: "0755"
 
-    - name: Copy application source from staging area to app directory
+    # -------------------------------------------------------------------------
+    # Copy application source from the checked-out repo
+    # -------------------------------------------------------------------------
+    - name: Synchronise application source files
       synchronize:
-        src: /tmp/app_source/
+        src: "{{ playbook_dir }}/../"
         dest: "{{ app_dir }}/"
         recursive: true
         delete: false
         rsync_opts:
+          - "--exclude=.git"
+          - "--exclude=.github"
+          - "--exclude=terraform"
+          - "--exclude=ansible"
           - "--exclude=__pycache__"
           - "--exclude=*.pyc"
-          - "--exclude=.git"
-      delegate_to: "{{ inventory_hostname }}"
+          - "--exclude=.venv"
+          - "--exclude=.env"
+      become: false
+      # synchronize runs as the ansible-connecting user; dest ownership fixed below
 
-    - name: Set ownership of application directory
+    - name: Fix ownership of application files
       file:
         path: "{{ app_dir }}"
         state: directory
@@ -83,155 +100,129 @@
         group: "{{ app_user }}"
         recurse: true
 
-    #  Python virtual environment 
-
-    - name: Create Python virtual environment at /opt/app/.venv
-      command: python3.11 -m venv {{ venv_dir }}
+    # -------------------------------------------------------------------------
+    # Python virtual environment
+    # -------------------------------------------------------------------------
+    - name: Create Python 3.11 virtual environment
+      command: python3.11 -m venv "{{ venv_dir }}"
       args:
         creates: "{{ venv_dir }}/bin/activate"
       become_user: "{{ app_user }}"
 
-    - name: Upgrade pip inside virtualenv
+    - name: Upgrade pip inside venv
       command: "{{ venv_dir }}/bin/pip install --upgrade pip"
       become_user: "{{ app_user }}"
 
-    - name: Install application dependencies from requirements.txt (if present)
+    - name: Install application dependencies
+      command: "{{ venv_dir }}/bin/pip install -r {{ app_dir }}/requirements.txt"
+      become_user: "{{ app_user }}"
+      args:
+        chdir: "{{ app_dir }}"
+
+    - name: Install gunicorn and uvicorn workers
+      command: "{{ venv_dir }}/bin/pip install gunicorn uvicorn[standard]"
+      become_user: "{{ app_user }}"
+
+    # -------------------------------------------------------------------------
+    # .env file (rendered via shell so empty values are handled safely)
+    # -------------------------------------------------------------------------
+    - name: Render .env file
       shell: |
-        if [ -f {{ app_dir }}/requirements.txt ]; then
-          {{ venv_dir }}/bin/pip install -r {{ app_dir }}/requirements.txt
-        fi
-      become_user: "{{ app_user }}"
-
-    - name: Ensure gunicorn is installed in virtualenv
-      command: "{{ venv_dir }}/bin/pip install gunicorn"
-      become_user: "{{ app_user }}"
-
-    - name: Ensure uvicorn is installed in virtualenv
-      command: "{{ venv_dir }}/bin/pip install 'uvicorn[standard]'"
-      become_user: "{{ app_user }}"
-
-    - name: Ensure fastapi is installed in virtualenv
-      command: "{{ venv_dir }}/bin/pip install fastapi"
-      become_user: "{{ app_user }}"
-
-    #  .env / application config 
-
-    - name: Render application environment file
-      shell: |
-        cat > {{ app_dir }}/.env << 'ENVEOF'
+        cat > {{ app_dir }}/.env <<'ENVEOF'
         APP_ENV=production
-        PORT=8000
-        HOST=127.0.0.1
+        PORT={{ app_port }}
+        HOST=0.0.0.0
         ENVEOF
       args:
         executable: /bin/bash
 
-    - name: Set ownership of .env file
+    - name: Fix .env ownership
       file:
         path: "{{ app_dir }}/.env"
         owner: "{{ app_user }}"
         group: "{{ app_user }}"
         mode: "0640"
 
-    #  systemd service 
-
-    - name: Write systemd service unit for the FastAPI application
+    # -------------------------------------------------------------------------
+    # systemd service
+    # -------------------------------------------------------------------------
+    - name: Write systemd service unit
       copy:
-        dest: /etc/systemd/system/fastapi-app.service
-        owner: root
-        group: root
-        mode: "0644"
+        dest: /etc/systemd/system/{{ service_name }}.service
         content: |
           [Unit]
-          Description=FastAPI Application (gunicorn + uvicorn)
+          Description=FastAPI application ({{ service_name }})
           After=network.target
-          Wants=network-online.target
 
           [Service]
-          Type=notify
+          Type=simple
           User={{ app_user }}
           Group={{ app_user }}
           WorkingDirectory={{ app_dir }}
           EnvironmentFile={{ app_dir }}/.env
-          ExecStart={{ venv_dir }}/bin/gunicorn app.main:app \
-              -k uvicorn.workers.UvicornWorker \
-              -w {{ gunicorn_workers }} \
-              -b 127.0.0.1:{{ app_port }} \
-              --timeout 120 \
-              --keep-alive 5 \
-              --log-level info \
-              --access-logfile - \
-              --error-logfile -
+          ExecStart={{ gunicorn_bin }} app.main:app \
+                      -k uvicorn.workers.UvicornWorker \
+                      -w 4 \
+                      -b 0.0.0.0:{{ app_port }} \
+                      --access-logfile - \
+                      --error-logfile -
           Restart=always
           RestartSec=5
-          KillMode=mixed
-          TimeoutStopSec=30
+          StandardOutput=journal
+          StandardError=journal
+          SyslogIdentifier={{ service_name }}
 
           [Install]
           WantedBy=multi-user.target
+        mode: "0644"
 
     - name: Reload systemd daemon
       systemd:
         daemon_reload: true
 
-    - name: Enable and start FastAPI application service
+    - name: Enable and start app service
       systemd:
-        name: fastapi-app
+        name: "{{ service_name }}"
         enabled: true
         state: restarted
 
-    #  nginx 
-
-    - name: Remove default nginx site configuration (Amazon Linux 2023)
+    # -------------------------------------------------------------------------
+    # nginx
+    # -------------------------------------------------------------------------
+    - name: Remove default nginx site (if present)
       file:
         path: /etc/nginx/conf.d/default.conf
         state: absent
       ignore_errors: true
 
-    - name: Remove default nginx site configuration (Ubuntu)
-      file:
-        path: /etc/nginx/sites-enabled/default
-        state: absent
-      ignore_errors: true
-
     - name: Write nginx virtual host configuration
       copy:
-        dest: /etc/nginx/conf.d/fastapi-app.conf
-        owner: root
-        group: root
-        mode: "0644"
+        dest: /etc/nginx/conf.d/app.conf
         content: |
-          upstream fastapi_backend {
-              server 127.0.0.1:{{ app_port }};
-              keepalive 32;
-          }
-
           server {
               listen 80 default_server;
-              listen [::]:80 default_server;
               server_name _;
 
-              access_log /var/log/nginx/fastapi-app-access.log;
-              error_log  /var/log/nginx/fastapi-app-error.log;
-
-              client_max_body_size 16M;
+              access_log  /var/log/nginx/app_access.log;
+              error_log   /var/log/nginx/app_error.log;
 
               location / {
-                  proxy_pass         http://fastapi_backend;
+                  proxy_pass         http://127.0.0.1:{{ app_port }};
                   proxy_http_version 1.1;
                   proxy_set_header   Host              $host;
                   proxy_set_header   X-Real-IP         $remote_addr;
                   proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
                   proxy_set_header   X-Forwarded-Proto $scheme;
-                  proxy_set_header   Connection        "";
-                  proxy_read_timeout 120s;
-                  proxy_connect_timeout 10s;
+                  proxy_set_header   Upgrade           $http_upgrade;
+                  proxy_set_header   Connection        "upgrade";
+                  proxy_read_timeout 300s;
+                  proxy_connect_timeout 75s;
               }
           }
+        mode: "0644"
 
-    - name: Test nginx configuration
+    - name: Validate nginx configuration
       command: nginx -t
-      register: nginx_test
       changed_when: false
 
     - name: Enable and restart nginx
@@ -240,15 +231,16 @@
         enabled: true
         state: restarted
 
-    #  Post-deploy health check (on-host) 
-
-    - name: Wait for application to be ready (on-host check)
+    # -------------------------------------------------------------------------
+    # Health check - confirm the app is answering on localhost:8000/health
+    # -------------------------------------------------------------------------
+    - name: Wait for application to become healthy (localhost check)
       uri:
-        url: "http://127.0.0.1:{{ app_port }}/health/"
+        url: "http://localhost:{{ app_port }}/health"
         method: GET
         status_code: 200
         timeout: 10
       register: health_result
       retries: 12
-      delay: 5
+      delay: 10
       until: health_result.status == 200

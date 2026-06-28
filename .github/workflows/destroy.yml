@@ -1,4 +1,4 @@
-name: Destroy flasktest Infrastructure
+name: Destroy flasktest-dev
 
 on:
   workflow_dispatch:
@@ -15,10 +15,10 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v3
 
       - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
+        uses: hashicorp/setup-terraform@v2
 
       - name: Terraform Init
         working-directory: terraform
